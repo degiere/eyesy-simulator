@@ -20,7 +20,11 @@ Usage:
 
 Keys, and the hardware control each one stands in for:
     1-5     select the active knob, of the five on the middle row
+    left/right
+            select the knob to either side, wrapping at the ends
     up/down turn the active knob
+    A       Audio In jack, back panel. Plugs the Mac's own output into the mode, so it
+            draws to whatever is playing. Press again to unplug
     O       On Screen Display button, top left — mode, screen size, knob meters, MIDI
             grid, gain and VU, trigger, palette strips
     T       Trigger button, bottom right on the panel. Tap fires once; holding swaps the
@@ -126,6 +130,15 @@ class SynthSignal:
         return v, v
 
 
+def _is_live(signal):
+    """True for a capture source, which holds OS resources until closed.
+
+    The generated signals are pure functions of the sample index and need no teardown,
+    so `close` is what separates a cable from a simulation.
+    """
+    return hasattr(signal, 'close')
+
+
 class AudioSource:
     """Stands in for the ALSA capture process in sound.py.
 
@@ -191,7 +204,9 @@ class Eyesy:
         self.knob2 = 0.5
         self.knob3 = 0.5
         self.knob4 = 0.5
-        self.knob5 = 0.5
+        # the background knob starts at zero, not centred: mid-scale on the slot 0
+        # picker is a flat mid grey that every mode then draws over
+        self.knob5 = 0.0
 
         self.xres = XRES
         self.yres = YRES
@@ -312,7 +327,9 @@ def main(setup, draw, mode_root, signal=None):
     mode_screen = pygame.Surface((XRES, YRES))
 
     eyesy = Eyesy(mode_root=mode_root)
-    idle_signal = signal or SilentSignal()
+    # what `A` falls back to when the cable comes out again
+    unplugged_signal = signal if signal and not _is_live(signal) else SilentSignal()
+    idle_signal = signal or unplugged_signal
     hold_signal = SynthSignal()
     audio = AudioSource(idle_signal)
     print(f'audio source: {audio.signal.label}')
@@ -325,7 +342,7 @@ def main(setup, draw, mode_root, signal=None):
     grab_index = 0
     trigger_held = False
     trigger_td = 0
-    show_osd = False
+    show_osd = True     # `O` hides it; screengrabs never contain it either way
     osd_font = pygame.font.Font(None, 22)
     arrow_td = 0        # frames an arrow has been held, as the device counts them
 
@@ -334,6 +351,33 @@ def main(setup, draw, mode_root, signal=None):
         value = min(1.0, max(0.0, getattr(eyesy, name) + step))
         setattr(eyesy, name, value)
         return name, value
+
+    def toggle_audio_input():
+        """`A` is the Audio In jack: pressing it plugs the Mac into the mode.
+
+        The tap is built on the first press and torn down on the second, so an idle
+        simulator holds no capture device.
+        """
+        nonlocal idle_signal
+        if _is_live(idle_signal):
+            idle_signal.close()
+            idle_signal = unplugged_signal
+            print(f'audio in: unplugged ({idle_signal.label})')
+            return
+
+        from system_audio import SystemAudioError, SystemAudioSignal
+        try:
+            idle_signal = SystemAudioSignal(exclude_pids=[os.getpid()])
+        except SystemAudioError as exc:
+            print(f'audio in: {exc}')
+            return
+        print(f'audio in: {idle_signal.label}')
+
+    def shutdown():
+        if _is_live(idle_signal):
+            idle_signal.close()
+        pygame.quit()
+        sys.exit()
 
     def report():
         print(
@@ -345,22 +389,27 @@ def main(setup, draw, mode_root, signal=None):
     while True:
         for event in pygame.event.get():
             if event.type == QUIT:
-                pygame.quit()
-                sys.exit()
+                shutdown()
             if event.type == KEYUP:
                 if event.key == K_t:
                     trigger_held = False
             if event.type == KEYDOWN:
                 if event.key == K_ESCAPE:
-                    pygame.quit()
-                    sys.exit()
+                    shutdown()
                 if K_1 <= event.key <= K_5:
                     active_knob = event.key - K_0
+                    print(f'knob{active_knob} active')
+                if event.key in (K_LEFT, K_RIGHT):
+                    # the row wraps, the way Mode Fwd/Back does on the panel
+                    step = 1 if event.key == K_RIGHT else -1
+                    active_knob = (active_knob - 1 + step) % 5 + 1
                     print(f'knob{active_knob} active')
                 if event.key == K_t:
                     eyesy.trig = True
                     trigger_held = True
                     trigger_td = 0
+                if event.key == K_a:
+                    toggle_audio_input()
                 if event.key == K_o:
                     show_osd = not show_osd
                 if event.key == K_p:
@@ -436,13 +485,24 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('file', type=argparse.FileType('r'))
-    parser.add_argument('--signal', choices=('silent', 'synth'), default='silent',
-                        help='input on the audio jack. "silent" is an unplugged '
-                             'input, as the device idles; "synth" is a tone that '
-                             'peaks twice a second so triggers fire unattended.')
+    parser.add_argument(
+        '--signal', choices=('silent', 'synth', 'system'), default='silent',
+        help='input on the audio jack. "silent" is an unplugged input, as the '
+             'device idles; "synth" is a tone that peaks twice a second so '
+             'triggers fire unattended; "system" captures whatever the Mac is '
+             'playing, so a mode can be developed against real music.')
     args = parser.parse_args()
 
-    signal = SynthSignal() if args.signal == 'synth' else SilentSignal()
+    if args.signal == 'system':
+        from system_audio import SystemAudioError, SystemAudioSignal
+        try:
+            signal = SystemAudioSignal(exclude_pids=[os.getpid()])
+        except SystemAudioError as exc:
+            raise SystemExit(f'system audio capture unavailable: {exc}')
+    elif args.signal == 'synth':
+        signal = SynthSignal()
+    else:
+        signal = SilentSignal()
 
     module_path = os.path.splitext(args.file.name)[0]
     mode_root = os.path.dirname(os.path.abspath(args.file.name)) + os.sep
