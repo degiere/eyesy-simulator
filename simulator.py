@@ -55,6 +55,7 @@ AUDIO_SAMPLES = 100
 SAMPLE_RATE = 32000
 AVERAGE_WINDOW = 16          # samples averaged into one buffer entry
 TRIGGER_THRESHOLD = 20000    # main.py fires eyesy.trig above this peak
+TRIGGER_HOLD_FRAMES = 10     # eyesy.py:1086 counts this before a held Trigger repeats
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -85,6 +86,21 @@ def load_palettes():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.abcd_palettes
+
+
+class SilentSignal:
+    """An unplugged input: the converter's noise floor and nothing else.
+
+    This is what `audio_in` holds on the device with no cable in the jack. Peaks stay
+    four orders of magnitude below the 20000 trigger threshold, so a mode sits still
+    until real signal or the Trigger button gives it one.
+    """
+
+    label = 'silent'
+
+    def sample(self, n):
+        v = random.uniform(-120, 120)
+        return v, v
 
 
 class SynthSignal:
@@ -119,7 +135,7 @@ class AudioSource:
     """
 
     def __init__(self, signal=None):
-        self.signal = signal or SynthSignal()
+        self.signal = signal or SilentSignal()
         self.buffer = [0] * AUDIO_SAMPLES
         self.buffer_r = [0] * AUDIO_SAMPLES
         self.write_index = 0
@@ -296,7 +312,9 @@ def main(setup, draw, mode_root, signal=None):
     mode_screen = pygame.Surface((XRES, YRES))
 
     eyesy = Eyesy(mode_root=mode_root)
-    audio = AudioSource(signal)
+    idle_signal = signal or SilentSignal()
+    hold_signal = SynthSignal()
+    audio = AudioSource(idle_signal)
     print(f'audio source: {audio.signal.label}')
     setup(hwscreen, eyesy)
 
@@ -307,7 +325,6 @@ def main(setup, draw, mode_root, signal=None):
     grab_index = 0
     trigger_held = False
     trigger_td = 0
-    undulate_p = 0.0
     show_osd = False
     osd_font = pygame.font.Font(None, 22)
     arrow_td = 0        # frames an arrow has been held, as the device counts them
@@ -382,29 +399,23 @@ def main(setup, draw, mode_root, signal=None):
         else:
             arrow_td = 0
 
-        if trigger_held:
-            # holding Trigger replaces the input with a sweeping sine and keeps firing,
-            # so the button plays the instrument with nothing plugged in
-            undulate_p += .005
-            undulate = ((math.sin(undulate_p * 2 * math.pi) + 1) * 2) + .5
-            for i in range(AUDIO_SAMPLES):
-                v = int(math.sin((i / AUDIO_SAMPLES) * 2 * math.pi * undulate) * 25000)
-                eyesy.audio_in[i] = v
-                eyesy.audio_in_r[i] = v
-            eyesy.audio_peak = 25000
-            eyesy.audio_peak_r = 25000
+        # A tap on Trigger is one trigger, fired on the keypress. Keep the key down past
+        # the device's repeat count and the jack picks up a tone that peaks twice a
+        # second, so the meter pulses and triggers keep arriving.
+        trigger_td = trigger_td + 1 if trigger_held else 0
+        audio.signal = hold_signal if trigger_td > TRIGGER_HOLD_FRAMES else idle_signal
 
-            trigger_td += 1
-            if trigger_td > 10:
-                eyesy.trig = True
-        else:
-            audio.advance(fps, gain)
-            eyesy.audio_in[:] = audio.buffer
-            eyesy.audio_in_r[:] = audio.buffer_r
-            eyesy.audio_peak = audio.peak
-            eyesy.audio_peak_r = audio.peak_r
-            if audio.peak > TRIGGER_THRESHOLD or audio.peak_r > TRIGGER_THRESHOLD:
-                eyesy.trig = True
+        audio.advance(fps, gain)
+        eyesy.audio_in[:] = audio.buffer
+        eyesy.audio_in_r[:] = audio.buffer_r
+        eyesy.audio_peak = audio.peak
+        eyesy.audio_peak_r = audio.peak_r
+        if audio.peak > TRIGGER_THRESHOLD or audio.peak_r > TRIGGER_THRESHOLD:
+            eyesy.trig = True
+        # eyesy.py:1086 — a held Trigger keeps firing once the repeat count is up,
+        # whatever the input is doing
+        if trigger_td > TRIGGER_HOLD_FRAMES:
+            eyesy.trig = True
 
         if eyesy.auto_clear:
             mode_screen.fill(eyesy.bg_color)
@@ -425,7 +436,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('file', type=argparse.FileType('r'))
+    parser.add_argument('--signal', choices=('silent', 'synth'), default='silent',
+                        help='input on the audio jack. "silent" is an unplugged '
+                             'input, as the device idles; "synth" is a tone that '
+                             'peaks twice a second so triggers fire unattended.')
     args = parser.parse_args()
+
+    signal = SynthSignal() if args.signal == 'synth' else SilentSignal()
 
     module_path = os.path.splitext(args.file.name)[0]
     mode_root = os.path.dirname(os.path.abspath(args.file.name)) + os.sep
@@ -437,4 +454,4 @@ if __name__ == "__main__":
     importlib.invalidate_caches()
     module = importlib.import_module(os.path.basename(module_path))
 
-    main(module.setup, module.draw, mode_root)
+    main(module.setup, module.draw, mode_root, signal)
