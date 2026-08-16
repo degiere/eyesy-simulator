@@ -15,12 +15,14 @@ device's own cosine palettes, and an audio buffer built the way sound.py builds 
 rotation, seam and all.
 
 Usage:
-    .venv/bin/python simulator.py examples/simple/main.py
+    .venv/bin/python simulator.py examples/ink-rings/main.py
     .venv/bin/python simulator.py /path/to/your-mode/main.py
 
 Keys, and the hardware control each one stands in for:
     1-5     select the active knob, of the five on the middle row
     up/down turn the active knob
+    O       On Screen Display button, top left — mode, screen size, knob meters, MIDI
+            grid, gain and VU, trigger, palette strips
     T       Trigger button, bottom right on the panel. Tap fires once; holding swaps the
             input for a sweeping sine and keeps firing
     P       Persist button, top right — stops the screen clearing between frames, so
@@ -43,6 +45,8 @@ import sys
 
 import pygame
 from pygame.locals import *
+
+import osd
 
 XRES, YRES = 1280, 720
 AUDIO_SAMPLES = 100
@@ -186,11 +190,18 @@ class Eyesy:
         self.midi_notes = [0] * 128
         self.midi_note_new = False
 
-        self.mode = 'local'
+        self.mode = os.path.basename(os.path.normpath(mode_root)) or 'local'
         self.mode_root = mode_root
 
         self.bg_color = (0, 0, 0)
         self.auto_clear = True
+        self.audio_gain = 0.25   # the OSD's gain bar reads this
+
+        self.VERSION = '3.1'
+        self.LGRAY = (200, 200, 200)
+        self.GREEN = (0, 255, 0)
+        self.RED = (255, 0, 0)
+        self.BLACK = (0, 0, 0)
 
         self.palettes = load_palettes()
         self.fg_palette = 0
@@ -297,6 +308,15 @@ def main(setup, draw, mode_root, signal=None):
     trigger_held = False
     trigger_td = 0
     undulate_p = 0.0
+    show_osd = False
+    osd_font = pygame.font.Font(None, 22)
+    arrow_td = 0        # frames an arrow has been held, as the device counts them
+
+    def turn_knob(step):
+        name = f'knob{active_knob}'
+        value = min(1.0, max(0.0, getattr(eyesy, name) + step))
+        setattr(eyesy, name, value)
+        return name, value
 
     def report():
         print(
@@ -324,6 +344,8 @@ def main(setup, draw, mode_root, signal=None):
                     eyesy.trig = True
                     trigger_held = True
                     trigger_td = 0
+                if event.key == K_o:
+                    show_osd = not show_osd
                 if event.key == K_p:
                     eyesy.auto_clear = not eyesy.auto_clear
                     report()
@@ -343,13 +365,22 @@ def main(setup, draw, mode_root, signal=None):
                 if event.key in (K_COMMA, K_PERIOD):
                     step = 0.05 if event.key == K_PERIOD else -0.05
                     gain = min(1.0, max(0.0, gain + step))
+                    eyesy.audio_gain = gain
                     report()
                 if event.key in (K_UP, K_DOWN):
-                    step = 0.05 if event.key == K_UP else -0.05
-                    name = f'knob{active_knob}'
-                    value = min(1.0, max(0.0, getattr(eyesy, name) + step))
-                    setattr(eyesy, name, value)
+                    name, value = turn_knob(0.05 if event.key == K_UP else -0.05)
                     print(f'{name} = {value:.2f}')
+                    arrow_td = 0
+
+        held = pygame.key.get_pressed()
+        if held[K_UP] or held[K_DOWN]:
+            arrow_td += 1
+            if arrow_td > 10:
+                name, value = turn_knob(0.02 if held[K_UP] else -0.02)
+                if arrow_td % 6 == 0:
+                    print(f'{name} = {value:.2f}')
+        else:
+            arrow_td = 0
 
         if trigger_held:
             # holding Trigger replaces the input with a sweeping sine and keeps firing,
@@ -379,6 +410,8 @@ def main(setup, draw, mode_root, signal=None):
             mode_screen.fill(eyesy.bg_color)
         draw(mode_screen, eyesy)
         hwscreen.blit(mode_screen, (0, 0))
+        if show_osd:
+            osd.render(hwscreen, eyesy, osd_font, active_knob)
         pygame.display.update()
 
         eyesy.trig = False

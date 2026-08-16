@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 grab-*.png
 .DS_Store
+CLAUDE.md
