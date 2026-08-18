@@ -200,13 +200,13 @@ class Eyesy:
     """Stand-in for the object EYESY OS v3 hands to setup() and draw()."""
 
     def __init__(self, mode_root='./'):
-        self.knob1 = 0.5
-        self.knob2 = 0.5
-        self.knob3 = 0.5
-        self.knob4 = 0.5
-        # the background knob starts at zero, not centred: mid-scale on the slot 0
-        # picker is a flat mid grey that every mode then draws over
-        self.knob5 = 0.0
+        # knob[] is where the hardware writes; knob1-knob5 are what a mode reads.
+        # set_knobs() copies one into the other, and the background knob starts at
+        # zero rather than centred: mid-scale on the slot 0 picker is a flat mid
+        # grey that every mode then draws over.
+        self.knob = [0.5, 0.5, 0.5, 0.5, 0.0]
+        self.key2_status = False    # the Shift button
+        self.set_knobs()
 
         self.xres = XRES
         self.yres = YRES
@@ -239,6 +239,22 @@ class Eyesy:
         self.bg_palette = 0
         self.color_lfo_inc = 0
         self.color_lfo_index = 0
+
+    def set_knobs(self):
+        """eyesy.py:449 — fill the primaries for the modes, but not under shift.
+
+        Holding shift freezes knob1-knob5 wherever they stood while knob[] keeps
+        tracking the hardware, so a mode that reads eyesy.knob[i] under
+        key2_status gets a second page. Nothing is restored on release: the
+        primary takes the knob's new position, because one pot serves both pages.
+        Shift + knob 1 is the engine's audio input gain and is not a mode's to use.
+        """
+        if not self.key2_status:
+            self.knob1 = self.knob[0]
+            self.knob2 = self.knob[1]
+            self.knob3 = self.knob[2]
+            self.knob4 = self.knob[3]
+            self.knob5 = self.knob[4]
 
     # -- color, ported from engines/python/eyesy.py --
 
@@ -347,10 +363,12 @@ def main(setup, draw, mode_root, signal=None):
     arrow_td = 0        # frames an arrow has been held, as the device counts them
 
     def turn_knob(step):
-        name = f'knob{active_knob}'
-        value = min(1.0, max(0.0, getattr(eyesy, name) + step))
-        setattr(eyesy, name, value)
-        return name, value
+        # always the hardware list; whether the mode sees the move is set_knobs' call
+        i = active_knob - 1
+        value = min(1.0, max(0.0, eyesy.knob[i] + step))
+        eyesy.knob[i] = value
+        page = 'shift+' if eyesy.key2_status else 'knob'
+        return f'{page}{active_knob}', value
 
     def toggle_audio_input():
         """`A` is the Audio In jack: pressing it plugs the Mac into the mode.
@@ -387,6 +405,10 @@ def main(setup, draw, mode_root, signal=None):
             f'gain {gain:.2f}')
 
     while True:
+        # Shift is the panel's Shift button. Held, it freezes the primaries and the
+        # arrows write the second page instead.
+        eyesy.key2_status = bool(pygame.key.get_mods() & KMOD_SHIFT)
+
         for event in pygame.event.get():
             if event.type == QUIT:
                 shutdown()
@@ -465,6 +487,8 @@ def main(setup, draw, mode_root, signal=None):
         # whatever the input is doing
         if trigger_td > TRIGGER_HOLD_FRAMES:
             eyesy.trig = True
+
+        eyesy.set_knobs()
 
         if eyesy.auto_clear:
             mode_screen.fill(eyesy.bg_color)
