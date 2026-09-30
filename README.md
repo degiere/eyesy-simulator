@@ -38,6 +38,7 @@ One knob serves both pages, so letting Shift go hands the ordinary knob whatever
 | `T` | **Trigger** button, bottom right. Tap to fire once; hold for a sweeping sine that keeps re-triggering |
 | `P` | **Persist** button, top right. Stops the screen clearing between frames so drawing accumulates |
 | `G` | **Screenshot** button; writes `grab-N.png` in the repo root |
+| `Q` | Shift + **Screenshot**: stop a scene's knob sequence, or play it again from the top |
 | `[` `]` | previous / next foreground palette |
 | `-` `=` | previous / next background palette |
 | `,` `.` | audio gain down / up |
@@ -49,6 +50,41 @@ One knob serves both pages, so letting Shift go hands the ordinary knob whatever
 
 Use `--signal system` to come up already plugged in, or `--signal synth` for a tone that peaks twice a second.
 
+## Scenes
+
+A scene on the unit is a folder in `/sdcard/Scenes` holding the mode's name, knobs 1–5, Persist and the palettes, and optionally a knob sequence the unit loops once the scene is recalled. The unit records sequences by hand, 33 seconds at most. The loader checks nothing but the shape, so a sequence written here can run as long as you like.
+
+    .venv/bin/python simulator.py path/to/main.py --scene path/to/scene-folder
+    .venv/bin/python simulator.py path/to/main.py --scene scene.json
+
+`--scene` recalls the scene after `setup()`, as the unit does at boot, and loops its sequence with the unit's own playback rule: each frame writes only the knobs whose value changed, so a knob the sequence holds still stays yours to turn.
+
+### Scene files
+
+A scene file describes a scene and its knob sequence in seconds. Each knob is held at a value, follows keyframes with easing, or rides waves around a centre; the loop has to end where it starts. `scene.py build` turns scene files into scene folders in the card's format:
+
+    .venv/bin/python scene.py build scene.json out/
+    .venv/bin/python scene.py show out/"My Scene"
+
+The sequencer steps once per drawn frame, not once per 1/30 s, so a scene file carries the frame rate its mode really runs at on the unit, and the simulator plays it at that rate.
+
+`keyframes.py` builds a scene file from knob settings picked out of a prospect library, with a hold and a tempo for each keyframe, speed limits per knob, and a veil for knobs that jump.
+
+### Looking without watching
+
+`explore.py` renders a mode headless on a virtual clock, so it sees the time it would see on the unit at that frame rate however fast the laptop draws:
+
+| Command | Renders |
+|---|---|
+| `sweep MODE --knob N` | one knob through its travel, a few frames per setting |
+| `grid MODE --knobs 1,3` | two knobs against each other |
+| `prospect MODE --count 72` | an evenly spread library of settings, one frame each, plus `library.json` |
+| `board LIBRARY p012=calm,p040=storm` | chosen library entries in order, as a storyboard |
+| `film MODE SCENE --every 5` | a scene sampled through its loop, and its motion second by second |
+| `thumb MODE SCENE` | the 320x240 `scene.jpg` the unit's menus show |
+
+Every frame is labelled with how much it moves and how bright it is, so a stall, a strobe or a dead patch shows as a number.
+
 ## License
 
 BSD 3-Clause. See `LICENSE`.
@@ -56,6 +92,13 @@ BSD 3-Clause. See `LICENSE`.
 `color_palettes.py` and `osd.py` are Critter & Guitari's — see `LICENSE-EYESY_OS.txt`.
 
 ## Changelog
+
+### 0.4 — 2026-09-30
+
+- Scenes: `--scene` recalls a scene folder or a scene file and loops its knob sequence the way the unit does, at the scene file's frame rate.
+- `scene.py` builds scene files into the card's scene format.
+- `explore.py` renders sweeps, prospect libraries, storyboards, filmstrips and thumbnails headless.
+- `keyframes.py` builds a scene file from keyframes picked out of a prospect library.
 
 ### 0.3 — 2026-08-15
 

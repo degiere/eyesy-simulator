@@ -32,10 +32,17 @@ Keys, and the hardware control each one stands in for:
     P       Persist button, top right — stops the screen clearing between frames, so
             drawing accumulates (auto_clear)
     G       Screenshot button, writes grab-N.png in the repo root
+    Q       Shift + Screenshot: stops or restarts a scene's knob sequence
     [ ]     foreground palette back / forward (Shift + Mode Back/Fwd)
     - =     background palette back / forward (Shift + Scene Back/Fwd)
     , .     audio gain down / up (Shift + Knob 1)
     Esc     quit
+
+With --scene, the mode starts on a scene: a folder in the card's format, or a scene
+file that scene.py builds on the fly. Its knobs, Persist and palettes are recalled after
+setup(), and its knob sequence loops, as it does on the unit after a recall. The frame
+rate follows the scene file, so the sequence runs at the pace it will on the unit; --fps
+sets it for a scene folder, which carries no rate of its own.
 
 See:
 * https://docs.critterandguitari.com/EYESY/ey_os_3/
@@ -51,6 +58,7 @@ import pygame
 from pygame.locals import *
 
 import osd
+import scene
 
 XRES, YRES = 1280, 720
 AUDIO_SAMPLES = 100
@@ -333,7 +341,7 @@ class Eyesy:
         return self.color_picker(2 - self.color_lfo_index)
 
 
-def main(setup, draw, mode_root, signal=None):
+def main(setup, draw, mode_root, signal=None, scene_path=None, fps=None):
     pygame.init()
     hwscreen = pygame.display.set_mode((XRES, YRES))
     pygame.display.set_caption('EYESY local harness')
@@ -351,10 +359,22 @@ def main(setup, draw, mode_root, signal=None):
     print(f'audio source: {audio.signal.label}')
     setup(hwscreen, eyesy)
 
+    # main.py loads scenes after every mode's setup(), so a recall overrides whatever
+    # setup() set, Persist included
+    sequence = scene.KnobSequence(None)
+    scene_file = None
+    if scene_path:
+        data, frames, scene_file = scene.open_scene(scene_path)
+        sequence = scene.recall(eyesy, data, frames)
+        if fps is None and scene_file is not None:
+            fps = scene_file.fps
+        print(f'scene: {os.path.basename(os.path.normpath(scene_path))}')
+        print('  ' + scene._describe(data, frames, fps).replace('\n', '\n  '))
+
     clock = pygame.time.Clock()
     active_knob = 1
     gain = 0.25          # config.json default on the unit
-    fps = 30
+    fps = fps or 30
     grab_index = 0
     trigger_held = False
     trigger_td = 0
@@ -437,6 +457,13 @@ def main(setup, draw, mode_root, signal=None):
                 if event.key == K_p:
                     eyesy.auto_clear = not eyesy.auto_clear
                     report()
+                if event.key == K_q and sequence.frames:
+                    # eyesy.py:1098 — stop, or play again from the top
+                    sequence.playing = not sequence.playing
+                    if sequence.playing:
+                        sequence.index = 0
+                    state = 'playing' if sequence.playing else 'stopped'
+                    print(f'knob sequence {state}')
                 if event.key == K_g:
                     path = os.path.join(HERE, f'grab-{grab_index}.png')
                     pygame.image.save(mode_screen, path)
@@ -488,6 +515,16 @@ def main(setup, draw, mode_root, signal=None):
         if trigger_td > TRIGGER_HOLD_FRAMES:
             eyesy.trig = True
 
+        # main.py:240 — the sequencer writes knob[] before the primaries are filled
+        before = sequence.index
+        sequence.run(eyesy)
+        if sequence.playing and sequence.index < before:
+            print('knob sequence: loop')
+        elif scene_file is not None and sequence.playing:
+            t = sequence.index / fps
+            if scene_file.section_at(t) != scene_file.section_at(max(0.0, t - 1 / fps)):
+                print(f'{t:6.1f} s  {scene_file.section_at(t)}')
+
         eyesy.set_knobs()
 
         if eyesy.auto_clear:
@@ -509,6 +546,12 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('file', type=argparse.FileType('r'))
+    parser.add_argument(
+        '--scene', metavar='PATH',
+        help='start on a scene: a folder in the card format, or a scene file (.json)')
+    parser.add_argument(
+        '--fps', type=float,
+        help='frame rate; defaults to the scene file\'s, else 30, the unit\'s cap')
     parser.add_argument(
         '--signal', choices=('silent', 'synth', 'system'), default='silent',
         help='input on the audio jack. "silent" is an unplugged input, as the '
@@ -538,4 +581,4 @@ if __name__ == "__main__":
     importlib.invalidate_caches()
     module = importlib.import_module(os.path.basename(module_path))
 
-    main(module.setup, module.draw, mode_root, signal)
+    main(module.setup, module.draw, mode_root, signal, args.scene, args.fps)
