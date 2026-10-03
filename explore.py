@@ -383,12 +383,19 @@ STRIP_CELL = (480, 270)     # one frame of a pool setting's strip
 STRIP_GAP = 0.5             # seconds between a strip's frames
 FLAT = 2.0                  # contrast under which a frame is an empty field
 
+TEXTURE = (240, 120, 60, 30)    # widths a strip frame is reduced to, to read its grain
+
 # How much each part of a frame's look counts when two frames are compared. Colour is
-# held to a fifth: where a mode turns its palette by the clock, the colour in a frame
-# belongs to the moment it was rendered, and no knob setting brings it back.
+# held to a tenth: where a mode turns its palette by the clock, the colour in a frame
+# belongs to the moment it was rendered, and no knob setting brings it back. Texture
+# carries the most, because the probe is too small to tell one fine grain from another
+# and whole regions of busy pictures would pass for one. Layout counts for little:
+# two frames of one look differ there by where their broad shapes happen to sit. The
+# knob settings count as part of the look, so a stretch of the knobs these numbers
+# cannot tell apart still gets its share of frames.
 WEIGHTS = {
-    'layout': 0.25, 'detail': 0.25, 'contrast': 0.10, 'move': 0.15, 'light': 0.05,
-    'colour': 0.20,
+    'layout': 0.05, 'detail': 0.10, 'texture': 0.25, 'tone': 0.10, 'contrast': 0.05,
+    'move': 0.15, 'light': 0.05, 'colour': 0.10, 'knobs': 0.40,
 }
 
 
@@ -458,6 +465,36 @@ def _features(raw):
         'colour': [round(v / total, 3) if total else 0.0 for v in hues]
         + [round(total / (len(lum) * 255), 3)],
     }
+
+
+def _texture(frame):
+    """A frame's grain and tones, read from its strip at four times the probe's size.
+
+    Texture is how much the picture changes between one scale and the next, from broad
+    forms down to fine grain: a field of small cells and a field of wide folds differ
+    here where the probe sees two even greys. Tone is how the brightness is shared out,
+    in eight steps from dark to light.
+    """
+    import math
+
+    w, h = frame.get_size()
+    levels = [frame] + [
+        pygame.transform.smoothscale(frame, (tw, tw * h // w)) for tw in TEXTURE]
+    bands = []
+    for fine, coarse in zip(levels, levels[1:]):
+        up = pygame.transform.smoothscale(coarse, fine.get_size())
+        over, under = fine.copy(), up.copy()
+        over.blit(up, (0, 0), special_flags=pygame.BLEND_RGB_SUB)
+        under.blit(fine, (0, 0), special_flags=pygame.BLEND_RGB_SUB)
+        gap = sum(pygame.transform.average_color(over)[:3])
+        gap += sum(pygame.transform.average_color(under)[:3])
+        bands.append(round(math.log1p(gap / 3), 3))
+
+    raw = pygame.image.tobytes(levels[3], 'RGB')
+    tones = [0] * 8
+    for i in range(0, len(raw), 3):
+        tones[(raw[i] * 299 + raw[i + 1] * 587 + raw[i + 2] * 114) // 32000] += 1
+    return {'texture': bands, 'tone': [round(v * 3 / len(raw), 3) for v in tones]}
 
 
 def _pool(args, rig, base, vary, lo, hi):
@@ -547,6 +584,9 @@ def _keep(out, count, weights, cols, rows):
     flat = len(pool['entries']) - len(live)
     if not live:
         raise SystemExit('every frame in the pool is flat')
+    for e in live:
+        e['features'].update(_texture(_frame(out, e['id']).convert(24)))
+        e['features']['knobs'] = e['knobs']
 
     vectors = [[] for _ in live]
     for group, weight in weights.items():
@@ -729,8 +769,8 @@ def main(argv):
     kp.add_argument('pool', help='a prospect --stops folder')
     kp.add_argument('--keep', type=int, default=100)
     kp.add_argument(
-        '--weights', help='layout=0.25,detail=0.25,contrast=0.1,move=0.15,'
-        'light=0.05,colour=0.2; any left out keep these values')
+        '--weights', help='layout=0.05,detail=0.1,texture=0.25,tone=0.1,contrast=0.05,'
+        'move=0.15,light=0.05,colour=0.1,knobs=0.4; any left out keep these values')
     kp.add_argument('--cols', type=int, default=6)
     kp.add_argument('--rows', type=int, default=4)
 
