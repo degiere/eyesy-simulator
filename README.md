@@ -79,6 +79,8 @@ The sequencer steps once per drawn frame, not once per 1/30 s, so a scene file c
 | `sweep MODE --knob N` | one knob through its travel, a few frames per setting |
 | `grid MODE --knobs 1,3` | two knobs against each other |
 | `prospect MODE --count 72` | an evenly spread library of settings, one frame each, plus `library.json` |
+| `prospect MODE --stops 11 --keep 100` | a pool of 1,331 settings, every three-knob combination of 10% stops, and the 100 frames that look least alike as `library.json`, each with a four-frame strip |
+| `keep POOL --weights colour=0.1` | keeps again from a rendered pool, with other weights or another count |
 | `board LIBRARY p012=calm,p040=storm` | chosen library entries in order, as a storyboard |
 | `film MODE SCENE --every 5` | a scene sampled through its loop, and its motion second by second |
 | `thumb MODE SCENE` | the 320x240 `scene.jpg` the unit's menus show |

@@ -16,6 +16,8 @@ anything is captured.
     python explore.py film MODE SCENE --every 10 --out film.png
     python explore.py thumb MODE SCENE --at 20 --out scene.jpg
     python explore.py prospect MODE --count 96 --out library/
+    python explore.py prospect MODE --stops 11 --keep 100 --out library/
+    python explore.py keep library/ --weights colour=0.1
     python explore.py board library/ p012=calm,p040=storm
 
 MODE is a mode's main.py. SCENE is a scene file (.json) or a scene folder. Every sheet notes
@@ -137,6 +139,10 @@ class Rig:
 
     def grab(self):
         return pygame.transform.smoothscale(self.screen, CELL)
+
+    def probe(self):
+        """The last frame at PROBE size, as RGB bytes."""
+        return self._prev
 
 
 class Sheet:
@@ -326,8 +332,14 @@ def cmd_prospect(args):
     rig = Rig(args.mode, args.fps, args.signal)
     base = _floats(args.base, 5) if args.base else [None] * 5
     base = [rig.eyesy.knob[i] if v is None else v for i, v in enumerate(base)]
+    if args.vary is None:
+        args.vary = '1,2,3,4,5' if args.stops else '1,2,3,4'
     vary = [int(k) - 1 for k in args.vary.split(',')]
     lo, hi = _floats(args.low, 5), _floats(args.high, 5)
+    if args.stops:
+        _pool(args, rig, base, vary, lo, hi)
+        _keep(args.out, args.keep, {}, args.cols, args.rows)
+        return
     frames_dir = os.path.join(args.out, 'frames')
     os.makedirs(frames_dir, exist_ok=True)
 
@@ -367,6 +379,239 @@ def cmd_prospect(args):
     _boards(args.out, entries, args.cols, args.rows, _name(args.mode))
 
 
+STRIP_CELL = (480, 270)     # one frame of a pool setting's strip
+STRIP_GAP = 0.5             # seconds between a strip's frames
+FLAT = 2.0                  # contrast under which a frame is an empty field
+
+# How much each part of a frame's look counts when two frames are compared. Colour is
+# held to a fifth: where a mode turns its palette by the clock, the colour in a frame
+# belongs to the moment it was rendered, and no knob setting brings it back.
+WEIGHTS = {
+    'layout': 0.25, 'detail': 0.25, 'contrast': 0.10, 'move': 0.15, 'light': 0.05,
+    'colour': 0.20,
+}
+
+
+def _array(stops, knobs):
+    """Stop numbers for `knobs` knobs, stops**3 rows.
+
+    An orthogonal array of strength three: any three knobs see every combination of
+    their stops exactly once, and any two see each of theirs `stops` times. It needs
+    a prime number of stops, no fewer than the knobs.
+    """
+    for c in range(stops):
+        for b in range(stops):
+            for a in range(stops):
+                yield [(a + b * j + c * j * j) % stops for j in range(knobs)]
+
+
+def _features(raw):
+    """What a probe frame looks like, as numbers: layout, detail, contrast, colour."""
+    import math
+
+    w, h = PROBE
+    lum = [
+        (raw[i] * 299 + raw[i + 1] * 587 + raw[i + 2] * 114) / 1000
+        for i in range(0, len(raw), 3)
+    ]
+    mean = sum(lum) / len(lum)
+    contrast = math.sqrt(sum((v - mean) ** 2 for v in lum) / len(lum))
+
+    def edges(cells, cw, ch):
+        across = sum(
+            abs(cells[y * cw + x] - cells[y * cw + x + 1])
+            for y in range(ch) for x in range(cw - 1)) / (ch * (cw - 1))
+        down = sum(
+            abs(cells[y * cw + x] - cells[(y + 1) * cw + x])
+            for y in range(ch - 1) for x in range(cw)) / ((ch - 1) * cw)
+        return [math.log1p(across), math.log1p(down)]
+
+    # where the light sits, in 4x4 blocks of the probe, with the overall level removed
+    cw, ch = w // 4, h // 4
+    blocks = [0.0] * (cw * ch)
+    for y in range(h):
+        for x in range(w):
+            blocks[y // 4 * cw + x // 4] += lum[y * w + x]
+    blocks = [v / 16 for v in blocks]
+
+    # which hues carry the colour, and how much colour there is
+    hues = [0.0] * 6
+    for i in range(0, len(raw), 3):
+        r, g, b = raw[i], raw[i + 1], raw[i + 2]
+        top = max(r, g, b)
+        chroma = top - min(r, g, b)
+        if chroma < 16:
+            continue
+        if top == r:
+            hue = ((g - b) / chroma) % 6
+        elif top == g:
+            hue = (b - r) / chroma + 2
+        else:
+            hue = (r - g) / chroma + 4
+        hues[int(hue) % 6] += chroma
+    total = sum(hues)
+
+    return {
+        'layout': [round(v - mean, 1) for v in blocks],
+        'detail': [round(v, 3) for v in edges(lum, w, h) + edges(blocks, cw, ch)],
+        'contrast': [round(contrast, 2)],
+        'colour': [round(v / total, 3) if total else 0.0 for v in hues]
+        + [round(total / (len(lum) * 255), 3)],
+    }
+
+
+def _pool(args, rig, base, vary, lo, hi):
+    """Every three-knob combination of stops, a strip of frames each, into pool.json.
+
+    The settings come from _array, each stop nudged a little so samples stay off band
+    edges and the visits to one stop land on slightly different positions. They run
+    shuffled, in one continuous run, each with its own settle time.
+    """
+    import json
+    import math
+    import random
+
+    stops = args.stops
+    if stops not in (5, 7, 11, 13) or len(vary) > stops:
+        raise SystemExit('--stops takes 5, 7, 11 or 13, and no fewer than the knobs')
+    rng = random.Random(args.seed)
+    settings = []
+    for n, row in enumerate(_array(stops, len(vary))):
+        knobs = list(base)
+        for j, k in enumerate(vary):
+            u = row[j] / (stops - 1) + rng.uniform(-args.jitter, args.jitter)
+            knobs[k] = round(lo[k] + (hi[k] - lo[k]) * min(1.0, max(0.0, u)), 3)
+        settings.append((f'p{n + 1:04d}', knobs))
+    order = list(range(len(settings)))
+    rng.shuffle(order)
+
+    strips_dir = os.path.join(args.out, 'strips')
+    os.makedirs(strips_dir, exist_ok=True)
+    strip = pygame.Surface((STRIP_CELL[0] * args.strip, STRIP_CELL[1]))
+    entries = [None] * len(settings)
+    rig.set_knobs(base)
+    rig.run(args.settle)
+    for done, n in enumerate(order):
+        pid, knobs = settings[n]
+        rig.set_knobs(knobs)
+        rig.run(args.settle)
+        features = _features(rig.probe())
+        for i in range(args.strip):
+            if i:
+                rig.run(STRIP_GAP)
+            strip.blit(
+                pygame.transform.smoothscale(rig.screen, STRIP_CELL),
+                (i * STRIP_CELL[0], 0))
+        pygame.image.save(strip, os.path.join(strips_dir, pid + '.jpg'))
+        change, light = rig.recent()
+        features['move'] = [round(math.log1p(change), 3)]
+        features['light'] = [round(light, 1)]
+        entries[n] = {
+            'id': pid, 'knobs': knobs,
+            'move': round(change, 2), 'light': round(light, 1),
+            'features': features,
+        }
+        if (done + 1) % 100 == 0 or done + 1 == len(order):
+            print(f'{done + 1} of {len(order)} settings')
+
+    with open(os.path.join(args.out, 'pool.json'), 'w') as f:
+        json.dump({
+            'mode': _name(args.mode), 'fps': rig.fps, 'settle': args.settle,
+            'vary': [k + 1 for k in vary],
+            # enough to render the same pool again, strips included
+            'args': {
+                'stops': stops, 'jitter': args.jitter, 'strip': args.strip,
+                'vary': args.vary, 'base': args.base, 'low': args.low,
+                'high': args.high, 'seed': args.seed, 'signal': args.signal,
+            },
+            'entries': entries,
+        }, f)
+
+
+def _keep(out, count, weights, cols, rows):
+    """The `count` pool frames that look least like each other, as library.json.
+
+    Each part of a frame's features is scaled so its spread across the pool equals its
+    weight, and frames are compared by straight distance. Starting from the most
+    ordinary frame, the one farthest from everything kept is added until there are
+    enough. A kept frame's reach is how many pool frames it is the nearest to: a large
+    reach is a plateau, a small one a nook.
+    """
+    import json
+    import math
+
+    with open(os.path.join(out, 'pool.json')) as f:
+        pool = json.load(f)
+    weights = {**WEIGHTS, **weights}
+    live = [e for e in pool['entries'] if e['features']['contrast'][0] >= FLAT]
+    flat = len(pool['entries']) - len(live)
+    if not live:
+        raise SystemExit('every frame in the pool is flat')
+
+    vectors = [[] for _ in live]
+    for group, weight in weights.items():
+        columns = list(zip(*(e['features'][group] for e in live)))
+        means = [sum(c) / len(c) for c in columns]
+        spread = sum(
+            sum((v - m) ** 2 for v in c) / len(c) for c, m in zip(columns, means))
+        scale = math.sqrt(weight / spread) if spread > 0 else 0.0
+        for vector, e in zip(vectors, live):
+            vector.extend(
+                (v - m) * scale for v, m in zip(e['features'][group], means))
+
+    def gap(a, b):
+        return sum((x - y) ** 2 for x, y in zip(a, b))
+
+    # every vector is centred, so the most ordinary frame is the one nearest zero
+    first = min(range(len(live)), key=lambda i: sum(x * x for x in vectors[i]))
+    kept = [first]
+    nearest = [gap(v, vectors[first]) for v in vectors]
+    owner = [0] * len(live)
+    while len(kept) < min(count, len(live)):
+        far = max(range(len(live)), key=nearest.__getitem__)
+        for i, v in enumerate(vectors):
+            d = gap(v, vectors[far])
+            if d < nearest[i]:
+                nearest[i], owner[i] = d, len(kept)
+        kept.append(far)
+
+    entries = []
+    for slot, i in enumerate(kept):
+        e = {k: v for k, v in live[i].items() if k != 'features'}
+        e['reach'] = owner.count(slot)
+        entries.append(e)
+    library = {k: v for k, v in pool.items() if k != 'entries'}
+    library['keep'] = {'count': len(entries), 'weights': weights, 'flat': flat}
+    library['entries'] = entries
+    with open(os.path.join(out, 'library.json'), 'w') as f:
+        json.dump(library, f, indent=1)
+    print(f'kept {len(entries)} of {len(live)}; {flat} flat frames left out')
+    _boards(out, entries, cols, rows, pool['mode'])
+
+
+def cmd_keep(args):
+    """Keep again from a rendered pool, with other weights or another count."""
+    weights = {}
+    for item in (args.weights or '').split(','):
+        if item:
+            group, _, value = item.partition('=')
+            if group.strip() not in WEIGHTS:
+                raise SystemExit(f'no such weight: {group.strip()}')
+            weights[group.strip()] = float(value)
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    _keep(args.pool, args.keep, weights, args.cols, args.rows)
+
+
+def _frame(out, pid):
+    """A library entry's frame: its own PNG, or the first frame of its strip."""
+    png = os.path.join(out, 'frames', pid + '.png')
+    if os.path.exists(png):
+        return pygame.image.load(png)
+    strip = pygame.image.load(os.path.join(out, 'strips', pid + '.jpg'))
+    return strip.subsurface((0, 0, STRIP_CELL[0], STRIP_CELL[1]))
+
+
 def _boards(out, entries, cols, rows, title, prefix='sheet'):
     per = cols * rows
     for start in range(0, len(entries), per):
@@ -375,11 +620,13 @@ def _boards(out, entries, cols, rows, title, prefix='sheet'):
             cols, (len(chunk) + cols - 1) // cols,
             f'{title}  {chunk[0]["id"]}-{chunk[-1]["id"]}')
         for i, e in enumerate(chunk):
-            image = pygame.image.load(os.path.join(out, 'frames', e['id'] + '.png'))
+            image = _frame(out, e['id'])
             label = e.get('name') or e['id']
+            stats = f'move {e["move"]:4.1f}  light {e["light"]:5.1f}'
+            if 'reach' in e:
+                stats += f'  reach {e["reach"]}'
             sheet.put(i % cols, i // cols, pygame.transform.smoothscale(image, CELL), [
-                f'{label}  ' + ' '.join(f'{v:.2f}' for v in e['knobs']),
-                f'move {e["move"]:4.1f}  light {e["light"]:5.1f}'])
+                f'{label}  ' + ' '.join(f'{v:.2f}' for v in e['knobs']), stats])
         sheet.save(os.path.join(out, f'{prefix}-{start // per + 1:02d}.png'))
 
 
@@ -458,7 +705,18 @@ def main(argv):
     pr.add_argument('--fps', type=float, default=30.0)
     pr.add_argument('--signal', choices=('silent', 'synth'), default='silent')
     pr.add_argument('--count', type=int, default=96)
-    pr.add_argument('--vary', default='1,2,3,4', help='knobs to sample')
+    pr.add_argument(
+        '--vary', default=None,
+        help='knobs to sample; 1,2,3,4 by default, all five with --stops')
+    pr.add_argument(
+        '--stops', type=int, default=None,
+        help='render a pool instead: every three-knob combination of this many '
+        'stops per knob (11 is every 10%%), then keep the most different frames')
+    pr.add_argument('--keep', type=int, default=100, help='frames kept from a pool')
+    pr.add_argument(
+        '--jitter', type=float, default=0.04, help='how far a pool sample strays '
+        'from its stop, as a fraction of the travel')
+    pr.add_argument('--strip', type=int, default=4, help='frames per pool setting')
     pr.add_argument('--base', help='values for the knobs held still; - leaves one')
     pr.add_argument('--low', default='0,0,0,0,0', help='lower bound per knob')
     pr.add_argument('--high', default='1,1,1,1,1', help='upper bound per knob')
@@ -466,6 +724,15 @@ def main(argv):
     pr.add_argument('--settle', type=float, default=4.0)
     pr.add_argument('--cols', type=int, default=6)
     pr.add_argument('--rows', type=int, default=4)
+
+    kp = sub.add_parser('keep', help='keep again from a rendered pool')
+    kp.add_argument('pool', help='a prospect --stops folder')
+    kp.add_argument('--keep', type=int, default=100)
+    kp.add_argument(
+        '--weights', help='layout=0.25,detail=0.25,contrast=0.1,move=0.15,'
+        'light=0.05,colour=0.2; any left out keep these values')
+    kp.add_argument('--cols', type=int, default=6)
+    kp.add_argument('--rows', type=int, default=4)
 
     bd = sub.add_parser('board', help='chosen library entries, in order')
     bd.add_argument('library', help='a prospect folder')
@@ -478,7 +745,7 @@ def main(argv):
         args.fps = 30.0
     {
         'sweep': cmd_sweep, 'grid': cmd_grid, 'film': cmd_film, 'thumb': cmd_thumb,
-        'prospect': cmd_prospect, 'board': cmd_board,
+        'prospect': cmd_prospect, 'keep': cmd_keep, 'board': cmd_board,
     }[args.command](args)
 
 
